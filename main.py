@@ -32,34 +32,16 @@ TIMEZONE = os.getenv("TIMEZONE", "Asia/Almaty")
 DATA_FILE = Path("data.json")
 
 DEFAULT_DATA = {
-    "polls": [
-        {
-            "id": 1,
-            "question": "Как прошла тренировка сегодня? 💪",
-            "options": ["Огонь! 🔥", "Хорошо 👍", "Средне 😐", "Плохо 😔", "Не ходил ❌"],
-            "active": True,
-        },
-        {
-            "id": 2,
-            "question": "Выполнил план на сегодня? ✅",
-            "options": ["Да, полностью!", "Почти всё", "Частично", "Не выполнил"],
-            "active": True,
-        },
-    ],
-    "settings": {
-        "group_id": None,
-        "send_time": "21:00",
-        "current_poll_index": 0,
-    },
     "checklists": [
         {
             "id": 1,
             "title": "План тренировки 💪",
-            "items": ["Отжимания 3x20 🤸", "Подтягивания 3x10 🏋️", "Планка 3x60сек ⏱", "Пресс 3x30 🔥"],
+            "items": ["Отжимания 3x20 🤸", "Подтягивания 3x10 🏋️", "Планка 60сек ⏱", "Пресс 3x30 🔥"],
             "active": True,
         }
     ],
     "checklist_settings": {
+        "group_id": None,
         "send_time": "08:00",
         "current_index": 0,
     },
@@ -76,10 +58,12 @@ def load_data() -> dict:
     if DATA_FILE.exists():
         with open(DATA_FILE, encoding="utf-8") as f:
             data = json.load(f)
-        # добавить новые ключи если их нет (для старых data.json)
         data.setdefault("checklists", DEFAULT_DATA["checklists"])
         data.setdefault("checklist_settings", DEFAULT_DATA["checklist_settings"])
         data.setdefault("daily_state", {})
+        # перенести group_id из старого settings если есть
+        if "settings" in data and data["settings"].get("group_id"):
+            data["checklist_settings"].setdefault("group_id", data["settings"]["group_id"])
         return data
     data = {k: v for k, v in DEFAULT_DATA.items()}
     save_data(data)
@@ -96,15 +80,6 @@ def today() -> str:
 
 
 # ---------- FSM ----------
-
-class AddPoll(StatesGroup):
-    question = State()
-    options = State()
-
-
-class SetTime(StatesGroup):
-    time = State()
-
 
 class AddChecklist(StatesGroup):
     title = State()
@@ -143,40 +118,11 @@ def build_checklist_keyboard(checklist_id: int, items: list, checks: dict) -> In
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-# ---------- Poll sender ----------
-
-async def send_daily_poll(bot: Bot):
-    data = load_data()
-    group_id = data["settings"].get("group_id")
-    polls = [p for p in data["polls"] if p.get("active", True)]
-
-    if not group_id:
-        logger.warning("Group ID не задан — опрос не отправлен.")
-        return
-    if not polls:
-        logger.warning("Нет активных опросов.")
-        return
-
-    idx = data["settings"].get("current_poll_index", 0) % len(polls)
-    poll = polls[idx]
-
-    await bot.send_poll(
-        chat_id=group_id,
-        question=poll["question"],
-        options=poll["options"],
-        is_anonymous=False,
-    )
-    logger.info(f"Опрос #{poll['id']} отправлен в группу {group_id}")
-
-    data["settings"]["current_poll_index"] = (idx + 1) % len(polls)
-    save_data(data)
-
-
 # ---------- Checklist sender ----------
 
 async def send_daily_checklist(bot: Bot):
     data = load_data()
-    group_id = data["settings"].get("group_id")
+    group_id = data["checklist_settings"].get("group_id")
     checklists = [c for c in data["checklists"] if c.get("active", True)]
 
     if not group_id:
@@ -190,10 +136,7 @@ async def send_daily_checklist(bot: Bot):
     checklist = checklists[idx]
     date = today()
 
-    data["daily_state"][date] = {
-        "checklist_id": checklist["id"],
-        "checks": {},
-    }
+    data["daily_state"][date] = {"checklist_id": checklist["id"], "checks": {}}
 
     keyboard = build_checklist_keyboard(checklist["id"], checklist["items"], {})
     msg = await bot.send_message(
@@ -209,19 +152,7 @@ async def send_daily_checklist(bot: Bot):
     logger.info(f"Чеклист #{checklist['id']} отправлен в группу {group_id}")
 
 
-# ---------- Schedulers ----------
-
-def reschedule_poll(bot: Bot, hour: int, minute: int):
-    if scheduler:
-        tz = pytz.timezone(TIMEZONE)
-        scheduler.add_job(
-            send_daily_poll,
-            CronTrigger(hour=hour, minute=minute, timezone=tz),
-            args=[bot], id="daily_poll", replace_existing=True,
-        )
-
-
-def reschedule_checklist(bot: Bot, hour: int, minute: int):
+def reschedule(bot: Bot, hour: int, minute: int):
     if scheduler:
         tz = pytz.timezone(TIMEZONE)
         scheduler.add_job(
@@ -231,7 +162,7 @@ def reschedule_checklist(bot: Bot, hour: int, minute: int):
         )
 
 
-# ---------- Callback: чеклист ----------
+# ---------- Callback ----------
 
 @router.callback_query(F.data.startswith("chk:"))
 async def handle_check(callback: CallbackQuery):
@@ -242,13 +173,11 @@ async def handle_check(callback: CallbackQuery):
     date = today()
 
     data = load_data()
-
     checklist = next((c for c in data["checklists"] if c["id"] == checklist_id), None)
     if not checklist:
         return await callback.answer("Чеклист не найден.")
 
     item = checklist["items"][item_idx]
-
     day = data["daily_state"].setdefault(date, {"checklist_id": checklist_id, "checks": {}})
     checks = day.setdefault("checks", {})
     done_by = checks.setdefault(item, [])
@@ -261,37 +190,28 @@ async def handle_check(callback: CallbackQuery):
         await callback.answer("Отмечено ✅")
 
     save_data(data)
-
     keyboard = build_checklist_keyboard(checklist_id, checklist["items"], checks)
     await callback.message.edit_reply_markup(reply_markup=keyboard)
 
 
-# ---------- /start ----------
+# ---------- Handlers ----------
 
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     await message.answer(
-        "👋 Привет! Я бот для ежедневных опросов и чеклистов.\n\n"
-        "📊 <b>Опросы:</b>\n"
-        "/addpoll — добавить опрос\n"
-        "/listpolls — список опросов\n"
-        "/delpoll &lt;id&gt; — удалить опрос\n"
-        "/settime — время рассылки опросов\n"
-        "/sendnow — отправить опрос сейчас\n\n"
+        "👋 Привет! Я бот для ежедневных чеклистов.\n\n"
         "✅ <b>Чеклисты:</b>\n"
         "/addchecklist — добавить чеклист\n"
         "/listchecklists — список чеклистов\n"
         "/delchecklist &lt;id&gt; — удалить чеклист\n"
-        "/setchecktime — время рассылки чеклистов\n"
+        "/setchecktime — время рассылки\n"
         "/checknow — отправить чеклист сейчас\n\n"
         "⚙️ <b>Настройки:</b>\n"
-        "/setgroup — установить эту группу для рассылки\n"
+        "/setgroup — установить группу для рассылки\n"
         "/status — текущие настройки",
         parse_mode="HTML",
     )
 
-
-# ---------- /status ----------
 
 @router.message(Command("status"))
 async def cmd_status(message: Message):
@@ -299,27 +219,19 @@ async def cmd_status(message: Message):
         return
 
     data = load_data()
-    s = data["settings"]
     cs = data["checklist_settings"]
-    polls = data["polls"]
     checklists = data["checklists"]
-    active_polls = [p for p in polls if p.get("active", True)]
-    active_cl = [c for c in checklists if c.get("active", True)]
-    group_id = s.get("group_id") or "не задана"
+    active = [c for c in checklists if c.get("active", True)]
+    group_id = cs.get("group_id") or "не задана"
 
     await message.answer(
         f"📊 <b>Статус бота:</b>\n\n"
-        f"👥 Группа: <code>{group_id}</code>\n\n"
-        f"📋 Опросы: {len(active_polls)} активных\n"
-        f"⏰ Время опросов: <b>{s.get('send_time', '21:00')}</b>\n\n"
-        f"✅ Чеклисты: {len(active_cl)} активных\n"
-        f"⏰ Время чеклистов: <b>{cs.get('send_time', '08:00')}</b>\n"
-        f"🌍 Часовой пояс: {TIMEZONE}",
+        f"👥 Группа: <code>{group_id}</code>\n"
+        f"⏰ Время рассылки: <b>{cs.get('send_time', '08:00')}</b> ({TIMEZONE})\n"
+        f"✅ Чеклистов: {len(checklists)} (активных: {len(active)})",
         parse_mode="HTML",
     )
 
-
-# ---------- /setgroup ----------
 
 @router.message(Command("setgroup"))
 async def cmd_setgroup(message: Message):
@@ -327,51 +239,13 @@ async def cmd_setgroup(message: Message):
         return
 
     data = load_data()
-    data["settings"]["group_id"] = message.chat.id
+    data["checklist_settings"]["group_id"] = message.chat.id
     save_data(data)
-
     await message.answer(
-        f"✅ Группа установлена!\n"
-        f"ID: <code>{message.chat.id}</code>",
+        f"✅ Группа установлена!\nID: <code>{message.chat.id}</code>",
         parse_mode="HTML",
     )
 
-
-# ---------- /settime ----------
-
-@router.message(Command("settime"))
-async def cmd_settime(message: Message, state: FSMContext):
-    if not await guard(message):
-        return
-
-    data = load_data()
-    current = data["settings"].get("send_time", "21:00")
-    await state.set_state(SetTime.time)
-    await message.answer(
-        f"⏰ Текущее время опросов: <b>{current}</b>\n\n"
-        f"Введи новое время (ЧЧ:ММ), например <code>21:00</code>",
-        parse_mode="HTML",
-    )
-
-
-@router.message(SetTime.time)
-async def process_settime(message: Message, state: FSMContext):
-    try:
-        hour, minute = map(int, message.text.strip().split(":"))
-        assert 0 <= hour <= 23 and 0 <= minute <= 59
-    except Exception:
-        return await message.answer("❌ Формат: ЧЧ:ММ, например <code>21:00</code>", parse_mode="HTML")
-
-    data = load_data()
-    data["settings"]["send_time"] = f"{hour:02d}:{minute:02d}"
-    save_data(data)
-    reschedule_poll(message.bot, hour, minute)
-
-    await state.clear()
-    await message.answer(f"✅ Время опросов: <b>{hour:02d}:{minute:02d}</b> ({TIMEZONE})", parse_mode="HTML")
-
-
-# ---------- /setchecktime ----------
 
 @router.message(Command("setchecktime"))
 async def cmd_setchecktime(message: Message, state: FSMContext):
@@ -382,8 +256,7 @@ async def cmd_setchecktime(message: Message, state: FSMContext):
     current = data["checklist_settings"].get("send_time", "08:00")
     await state.set_state(SetCheckTime.time)
     await message.answer(
-        f"⏰ Текущее время чеклистов: <b>{current}</b>\n\n"
-        f"Введи новое время (ЧЧ:ММ), например <code>08:00</code>",
+        f"⏰ Текущее время: <b>{current}</b>\n\nВведи новое время (ЧЧ:ММ), например <code>08:00</code>",
         parse_mode="HTML",
     )
 
@@ -399,125 +272,21 @@ async def process_setchecktime(message: Message, state: FSMContext):
     data = load_data()
     data["checklist_settings"]["send_time"] = f"{hour:02d}:{minute:02d}"
     save_data(data)
-    reschedule_checklist(message.bot, hour, minute)
+    reschedule(message.bot, hour, minute)
 
     await state.clear()
-    await message.answer(f"✅ Время чеклистов: <b>{hour:02d}:{minute:02d}</b> ({TIMEZONE})", parse_mode="HTML")
+    await message.answer(f"✅ Время рассылки: <b>{hour:02d}:{minute:02d}</b> ({TIMEZONE})", parse_mode="HTML")
 
-
-# ---------- Опросы ----------
-
-@router.message(Command("addpoll"))
-async def cmd_addpoll(message: Message, state: FSMContext):
-    if not await guard(message):
-        return
-    await state.set_state(AddPoll.question)
-    await message.answer("📝 Введи <b>вопрос</b> для опроса:", parse_mode="HTML")
-
-
-@router.message(AddPoll.question)
-async def process_poll_question(message: Message, state: FSMContext):
-    if len(message.text) > 300:
-        return await message.answer("❌ Вопрос слишком длинный (макс. 300 символов).")
-    await state.update_data(question=message.text.strip())
-    await state.set_state(AddPoll.options)
-    await message.answer(
-        "📋 Введи <b>варианты ответов</b> — каждый с новой строки.\n\n"
-        "Пример:\n<code>Отлично! 🔥\nХорошо 👍\nСредне 😐\nПлохо 😔</code>",
-        parse_mode="HTML",
-    )
-
-
-@router.message(AddPoll.options)
-async def process_poll_options(message: Message, state: FSMContext):
-    options = [o.strip() for o in message.text.strip().split("\n") if o.strip()]
-    if len(options) < 2:
-        return await message.answer("❌ Нужно минимум 2 варианта!")
-    if len(options) > 10:
-        return await message.answer("❌ Максимум 10 вариантов!")
-    if any(len(o) > 100 for o in options):
-        return await message.answer("❌ Вариант слишком длинный (макс. 100 символов).")
-
-    fsm_data = await state.get_data()
-    data = load_data()
-    poll_id = max((p["id"] for p in data["polls"]), default=0) + 1
-    data["polls"].append({"id": poll_id, "question": fsm_data["question"], "options": options, "active": True})
-    save_data(data)
-    await state.clear()
-
-    opts_text = "\n".join(f"  {i+1}. {o}" for i, o in enumerate(options))
-    await message.answer(
-        f"✅ Опрос #{poll_id} добавлен!\n\n❓ <b>{fsm_data['question']}</b>\n\n{opts_text}",
-        parse_mode="HTML",
-    )
-
-
-@router.message(Command("listpolls"))
-async def cmd_listpolls(message: Message):
-    if not await guard(message):
-        return
-    data = load_data()
-    if not data["polls"]:
-        return await message.answer("📭 Опросов нет. Добавь через /addpoll")
-
-    lines = ["📋 <b>Список опросов:</b>\n"]
-    for p in data["polls"]:
-        status = "✅" if p.get("active", True) else "⏸"
-        opts = "\n".join(f"    • {o}" for o in p["options"])
-        lines.append(f"{status} <b>#{p['id']}</b>: {p['question']}\n{opts}\n")
-    await message.answer("\n".join(lines), parse_mode="HTML")
-
-
-@router.message(Command("delpoll"))
-async def cmd_delpoll(message: Message):
-    if not await guard(message):
-        return
-    args = message.text.split()
-    if len(args) < 2:
-        data = load_data()
-        if not data["polls"]:
-            return await message.answer("📭 Опросов нет.")
-        lst = "\n".join(f"  #{p['id']}: {p['question']}" for p in data["polls"])
-        return await message.answer(f"Укажи ID:\n<code>/delpoll &lt;id&gt;</code>\n\n{lst}", parse_mode="HTML")
-
-    try:
-        poll_id = int(args[1])
-    except ValueError:
-        return await message.answer("❌ Пример: <code>/delpoll 1</code>", parse_mode="HTML")
-
-    data = load_data()
-    before = len(data["polls"])
-    data["polls"] = [p for p in data["polls"] if p["id"] != poll_id]
-    if len(data["polls"]) == before:
-        return await message.answer(f"❌ Опрос #{poll_id} не найден.")
-
-    active = [p for p in data["polls"] if p.get("active", True)]
-    data["settings"]["current_poll_index"] = (
-        data["settings"].get("current_poll_index", 0) % len(active) if active else 0
-    )
-    save_data(data)
-    await message.answer(f"🗑 Опрос #{poll_id} удалён.")
-
-
-@router.message(Command("sendnow"))
-async def cmd_sendnow(message: Message):
-    if not await guard(message):
-        return
-    try:
-        await send_daily_poll(message.bot)
-        await message.answer("✅ Опрос отправлен!")
-    except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
-
-
-# ---------- Чеклисты ----------
 
 @router.message(Command("addchecklist"))
 async def cmd_addchecklist(message: Message, state: FSMContext):
     if not await guard(message):
         return
     await state.set_state(AddChecklist.title)
-    await message.answer("📝 Введи <b>название</b> чеклиста:\n\nНапример: <code>Тренировка на сегодня 💪</code>", parse_mode="HTML")
+    await message.answer(
+        "📝 Введи <b>название</b> чеклиста:\n\nНапример: <code>Тренировка на сегодня 💪</code>",
+        parse_mode="HTML",
+    )
 
 
 @router.message(AddChecklist.title)
@@ -525,12 +294,9 @@ async def process_cl_title(message: Message, state: FSMContext):
     await state.update_data(title=message.text.strip())
     await state.set_state(AddChecklist.items)
     await message.answer(
-        "📋 Введи <b>пункты</b> чеклиста — каждый с новой строки.\n\n"
+        "📋 Введи <b>пункты</b> — каждый с новой строки.\n\n"
         "Пример:\n"
-        "<code>Отжимания 3x20 🤸\n"
-        "Подтягивания 3x10 🏋️\n"
-        "Планка 60сек ⏱\n"
-        "Пресс 3x30 🔥</code>",
+        "<code>Отжимания 3x20 🤸\nПодтягивания 3x10 🏋️\nПланка 60сек ⏱\nПресс 3x30 🔥</code>",
         parse_mode="HTML",
     )
 
@@ -552,8 +318,7 @@ async def process_cl_items(message: Message, state: FSMContext):
 
     items_text = "\n".join(f"  ☐ {it}" for it in items)
     await message.answer(
-        f"✅ Чеклист #{cl_id} добавлен!\n\n"
-        f"📋 <b>{fsm_data['title']}</b>\n{items_text}",
+        f"✅ Чеклист #{cl_id} добавлен!\n\n📋 <b>{fsm_data['title']}</b>\n{items_text}",
         parse_mode="HTML",
     )
 
@@ -630,21 +395,18 @@ async def main():
 
     data = load_data()
     tz = pytz.timezone(TIMEZONE)
-
-    poll_time = data["settings"].get("send_time", "21:00")
-    ph, pm = map(int, poll_time.split(":"))
-
-    check_time = data["checklist_settings"].get("send_time", "08:00")
-    ch, cm = map(int, check_time.split(":"))
+    send_time = data["checklist_settings"].get("send_time", "08:00")
+    hour, minute = map(int, send_time.split(":"))
 
     scheduler = AsyncIOScheduler(timezone=tz)
-    scheduler.add_job(send_daily_poll, CronTrigger(hour=ph, minute=pm, timezone=tz),
-                      args=[bot], id="daily_poll", replace_existing=True)
-    scheduler.add_job(send_daily_checklist, CronTrigger(hour=ch, minute=cm, timezone=tz),
-                      args=[bot], id="daily_checklist", replace_existing=True)
+    scheduler.add_job(
+        send_daily_checklist,
+        CronTrigger(hour=hour, minute=minute, timezone=tz),
+        args=[bot], id="daily_checklist", replace_existing=True,
+    )
     scheduler.start()
 
-    logger.info(f"Бот запущен. Чеклист в {check_time}, опрос в {poll_time} ({TIMEZONE})")
+    logger.info(f"Бот запущен. Чеклист каждый день в {send_time} ({TIMEZONE})")
 
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
